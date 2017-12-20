@@ -1,0 +1,72 @@
+#!/bin/bash
+# iptables firewall .
+# This file should be located at /etc/firewall.bash, and is meant to work with
+# Jeff Geerling's firewall init script.
+
+# No spoofing.
+if [ -e /proc/sys/net/ipv4/conf/all/rp_filter ]
+then
+for filter in /proc/sys/net/ipv4/conf/*/rp_filter
+do
+echo 1 > $filter
+done
+fi
+
+# Completely reset the firewall by removing all rules and chains.
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+iptables -t nat -F
+iptables -t mangle -F
+iptables -F
+iptables -X
+
+# Accept traffic from loopback interface (localhost).
+iptables -A INPUT -i lo -j ACCEPT
+
+# Allow established connections:
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# masking outgoing tasks
+{% for source in masquerade_task.source %}
+{% set ss = source %}
+{% for int in masquerade_task.mask %}
+iptables -t nat -A POSTROUTING -s {{ss}} -o {{int.int}} -j SNAT --to-source {{int.exit}}
+iptables -A FORWARD -s {{ss}} -i vl99 -o {{int.int}} -j ACCEPT
+{% endfor %}
+{% endfor %}
+
+# Forwarded ports from external to local resource
+{# Add a rule for each external forwarded port #}
+{% for port in firewall_ext_forwarded_tcp_ports %}
+iptables -t nat -A PREROUTING -p tcp -d {{port.ext_ip}} --dport {{ port.ext_port }} -j DNAT --to-destination {{port.forward_dest_to}}:{{port.forward_dest_port}}
+iptables -t nat -A POSTROUTING -d {{port.forward_dest_to}} -p tcp -m tcp --dport {{port.forward_dest_port}} -j SNAT --to-source {{port.local_ext_ip}}
+iptables -A FORWARD -i vl192 -o {{port.forward_int}} -p tcp -d {{port.forward_dest_to}} --dport {{port.forward_dest_port}} -j ACCEPT
+{% endfor %}
+
+# Open ports.
+{# Add a rule for each open port #}
+{% for port in firewall_allowed_tcp_ports %}
+iptables -A INPUT -s {{ port.ingress }} -p tcp -m tcp --dport {{ port.port }} -j ACCEPT
+{% endfor %}
+{% for port in firewall_allowed_udp_ports %}
+iptables -A INPUT -s {{ port.ingress }} -p udp -m udp --dport {{ port.port }} -j ACCEPT
+{% endfor %}
+
+# Accept icmp ping requests.
+iptables -A INPUT -p icmp -j ACCEPT
+
+# Additional custom rules.
+{% for rule in firewall_additional_rules %}
+{{ rule }}
+{% endfor %}
+{% if firewall_log_dropped_packets %}
+
+# Log other incoming requests (all of which are dropped) at 15/minute max.
+iptables -A INPUT -m limit --limit 15/minute -j LOG --log-level 7 --log-prefix "Dropped by firewall: "
+{% endif %}
+
+# Drop all other traffic.
+iptables -A INPUT -j REJECT --reject-with icmp-host-prohibited
+iptables -A FORWARD -j REJECT --reject-with icmp-host-prohibited
